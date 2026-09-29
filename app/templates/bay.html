@@ -21,6 +21,7 @@
   {% if error %}
   <div class="error-box">{{ error }}</div>
   {% endif %}
+  <div class="error-box" x-show="consistencyError" x-cloak x-text="consistencyError"></div>
 
   <div class="bay-scroll" role="list">
     <template x-for="v in filteredVats()" :key="v.id">
@@ -37,7 +38,8 @@
           <span class="status-dot"></span>
           <span x-text="v.statusLabel"></span>
         </div>
-        <svg class="spark" width="72" height="28" viewBox="0 0 72 28" aria-hidden="true">
+        <svg class="spark" width="72" height="28" viewBox="0 0 72 28" aria-hidden="true"
+             :title="'折线 ' + v.spark.length + ' 点 / 近笔带电位 ' + redoxCount(v) + ' 条'">
           <polyline
             x-show="v.spark.length"
             fill="none"
@@ -45,7 +47,7 @@
             stroke-width="1.6"
             stroke-linejoin="round"
             stroke-linecap="round"
-            :points="v.spark.map(p => p.x + ',' + p.y).join(' ')"
+            :points="sparkPoints(v)"
           ></polyline>
           <line
             x-show="!v.spark.length"
@@ -131,7 +133,8 @@
   </div>
 
   <p class="rule-foot">工坊只作缸位筛选片；浸染与状态均在缸位展开区内完成，无独立表页。
-    <a href="#" @click.prevent="selectedId && (window.location='/bay/partial/'+selectedId)">局部刷新本缸折线</a></p>
+    <a href="#"
+       @click.prevent="selectedId && (window.location=partialUrl(selectedId))">局部刷新本缸折线</a></p>
 </div>
 
 <script>
@@ -141,6 +144,8 @@
       vats: {{ vats | tojson }},
       filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
       selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      consistencyError: '',
+      STATUS_LABELS: { idle: '闲置', reducing: '还原中', ready: '可染色' },
       init() {
         const params = new URLSearchParams(window.location.search);
         if (params.has('workshop') && this.filterWs === null) {
@@ -151,6 +156,37 @@
           const v = parseInt(params.get('vat'), 10);
           if (!isNaN(v)) this.selectedId = v;
         }
+        // 整页与局部走同一模板、同一校验：折线点数必须等于近笔带电位条数，
+        // 角标文案必须与当前状态一致。任一路对不上直接判失败并亮错，不许静默展示。
+        this.consistencyError = this.audit() || '';
+      },
+      redoxCount(v) {
+        return v.recentLots.filter(l => l.redoxMv !== null).length;
+      },
+      sparkPoints(v) {
+        return v.spark.map(p => p.x + ',' + p.y).join(' ');
+      },
+      audit() {
+        for (const v of this.vats) {
+          if (v.spark.length !== this.redoxCount(v)) {
+            return '缸 ' + v.code + ' 数据口径不一致：折线 ' + v.spark.length +
+              ' 点，近笔带电位 ' + this.redoxCount(v) + ' 条，请刷新整页或联系维护。';
+          }
+          if (this.STATUS_LABELS[v.status] !== v.statusLabel) {
+            return '缸 ' + v.code + ' 状态角标与实际状态不一致：角标「' + v.statusLabel +
+              '」实际为「' + (this.STATUS_LABELS[v.status] || v.status) + '」。';
+          }
+        }
+        if (this.selectedId !== null && !this.vats.some(v => v.id === this.selectedId)) {
+          return '展开的缸位数据缺失，还原台无法显示该缸。';
+        }
+        return '';
+      },
+      partialUrl(id) {
+        // 局部刷新与整页同口径（同缸主键、同工坊筛选），服务端按同一排序键重算
+        let url = '/bay/partial/' + id;
+        if (this.filterWs !== null) url += '?workshop=' + this.filterWs;
+        return url;
       },
       setFilter(id) {
         this.filterWs = id;

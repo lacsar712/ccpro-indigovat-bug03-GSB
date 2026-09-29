@@ -21,5 +21,7 @@ def assert_can_mark_ready(latest: Optional[DipLot]) -> None:
 
 
 def validate_vat_status_change(vat: Vat, new_status: str, latest: Optional[DipLot]) -> None:
+    if new_status not in (Vat.STATUS_IDLE, Vat.STATUS_REDUCING, Vat.STATUS_READY):
+        raise VatRuleError(f"目标状态无效：{new_status!r}")
     if new_status == Vat.STATUS_READY:
         assert_can_mark_ready(latest)

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -59,7 +59,14 @@ class Vat(Base):
     def latest_lot(self) -> Optional["DipLot"]:
         if not self.lots:
             return None
-        return sorted(self.lots, key=lambda x: (x.dippedAt, x.id), reverse=True)[0]
+
+        def key(lot: "DipLot"):
+            ts = lot.dippedAt
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (ts.astimezone(timezone.utc), lot.id)
+
+        return sorted(self.lots, key=key, reverse=True)[0]
 
 
 class DipLot(Base):
