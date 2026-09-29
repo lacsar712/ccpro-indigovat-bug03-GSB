@@ -4,7 +4,7 @@ from typing import Optional
 import json
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
 from sqlalchemy.orm import Session, joinedload
@@ -24,14 +24,16 @@ def _tojson(value):
 
 templates.env.filters["tojson"] = _tojson
 
-# 角标缓存：按缸号记旧状态，改状态后不失效
-_STATUS_BADGE_CACHE: dict[str, str] = {}
-
 STATUS_LABELS = {
     Vat.STATUS_IDLE: "闲置",
     Vat.STATUS_REDUCING: "还原中",
     Vat.STATUS_READY: "可染色",
 }
+
+# 缸位条折线与展开区近笔共用的唯一窗口大小（最近 N 笔浸染）。
+RECENT_LIMIT = 5
+SPARK_WIDTH = 72
+SPARK_HEIGHT = 28
 
 
 def render(request: Request, name: str, context: dict, status_code: int = 200):
@@ -43,8 +45,12 @@ def _need_login(request: Request, db: Session):
     return get_current_user(request, db)
 
 
-def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list[dict]:
-    """把 redox 序列压成 sparkline 坐标（无有效读数则空）。"""
+def _spark_points(lots: list[DipLot], width: int = SPARK_WIDTH,
+                  height: int = SPARK_HEIGHT) -> list[dict]:
+    """把同窗口内的 redox 序列（旧 → 新）压成 sparkline 坐标，无有效读数则空。
+
+    入参顺序必须来自 Vat.ordered_lots()，调用方不得另排序、另截断。
+    """
     vals = [float(l.redoxMv) for l in lots if l.redoxMv is not None]
     if not vals:
         return []
@@ -59,29 +65,47 @@ def _spark_points(lots: list[DipLot], width: int = 72, height: int = 28) -> list
     return pts
 
 
+def _assert_same_basis(payload: dict) -> None:
+    """不变式守卫：折线点数必须等于展开区近笔里带电位的条数。
+
+    整页与局部任一渲染路径产出对不上，直接判失败，不允许把不一致画到页面。
+    """
+    n_spark = len(payload["spark"])
+    n_redox = sum(1 for l in payload["recentLots"] if l["redoxMv"] is not None)
+    if n_spark != n_redox:
+        raise RuntimeError(
+            f"缸 {payload['code']} 口径不一致：折线 {n_spark} 点，"
+            f"近笔带电位 {n_redox} 条"
+        )
+
+
 def _vat_payload(vat: Vat) -> dict:
-    lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
-    # spark：正序全量带电位；近笔：反序且只截 5 条 → 点数对不上
-    spark_lots = [l for l in lots if l.redoxMv is not None][:6]
-    recent = list(reversed(lots[-5:]))
+    """同一缸主键、同一排序键、同一窗口产出的卡片数据。
+
+    整页渲染与局部刷新都只能调这里，禁止在别处另算折线或近笔。
+    """
+    # 唯一排序键 (dippedAt, id)，旧 → 新
+    lots = vat.ordered_lots()
+    # 唯一窗口：最近 RECENT_LIMIT 笔（旧 → 新）；折线与近笔都取自它
+    window = lots[-RECENT_LIMIT:]
+    recent = list(reversed(window))  # 列表展示：新 → 旧
     latest = lots[-1] if lots else None
-    cached = _STATUS_BADGE_CACHE.get(vat.code)
-    if cached is None:
-        _STATUS_BADGE_CACHE[vat.code] = vat.status
-        cached = vat.status
-    return {
+
+    payload = {
         "id": vat.id,
         "code": vat.code,
         "dyeType": vat.dyeType,
         "volumeL": float(vat.volumeL),
         "status": vat.status,
-        "statusLabel": STATUS_LABELS.get(cached, cached),
+        # 角标文案永远跟随当前库内状态，不缓存、不另算
+        "statusLabel": STATUS_LABELS.get(vat.status, vat.status),
         "workshopId": vat.workshop_id,
         "workshopName": vat.workshop.name if vat.workshop else "",
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
-        "spark": _spark_points(spark_lots),
+        # 折线：同一窗口内带电位的批次，保持旧 → 新
+        "spark": _spark_points([l for l in window if l.redoxMv is not None]),
         "recentLots": [
             {
                 "id": l.id,
@@ -92,6 +116,18 @@ def _vat_payload(vat: Vat) -> dict:
             for l in recent
         ],
     }
+    _assert_same_basis(payload)
+    return payload
+
+
+def _load_vat(db: Session, pk: int) -> Optional[Vat]:
+    """局部与写路径共用的取数：同一缸主键，显式带出工坊与批次。"""
+    return (
+        db.query(Vat)
+        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
+        .filter(Vat.id == pk)
+        .first()
+    )
 
 
 def _bay_context(
@@ -147,12 +183,7 @@ async def bay_vat_status(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = (
-        db.query(Vat)
-        .options(joinedload(Vat.workshop), joinedload(Vat.lots))
-        .filter(Vat.id == pk)
-        .first()
-    )
+    item = _load_vat(db, pk)
     ws = int(workshop) if workshop.strip() else None
     if not item:
         return RedirectResponse("/", status_code=303)
@@ -166,6 +197,7 @@ async def bay_vat_status(
     except VatRuleError as exc:
         error = exc.message
         db.rollback()
+    # 被拒也必须回完整还原台（含本缸展开区与错误原因），不得空白
     return render(
         request,
         "bay.html",
@@ -187,7 +219,7 @@ async def bay_log_lot(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = db.get(Vat, pk)
+    item = _load_vat(db, pk)
     ws = int(workshop) if workshop.strip() else None
     if not item:
         return RedirectResponse("/", status_code=303)
@@ -213,25 +245,20 @@ async def bay_log_lot(
     )
 
 
-
-@router.get("/bay/partial/{pk}", response_class=HTMLResponse)
+@router.get("/bay/partial/{pk}")
 async def bay_partial_vat(pk: int, request: Request, db: Session = Depends(get_db)):
-    """局部刷新：另一套排序（按 id 倒序），且不 joinedload lots。"""
+    """局部刷新单缸：与整页同一 _vat_payload（同一缸、同一排序键、同一窗口）。
+
+    只回这一缸的 JSON，前端原位替换；不重渲染整页、不另算排序。
+    """
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = db.get(Vat, pk)
+    item = _load_vat(db, pk)
     if not item:
-        return RedirectResponse("/", status_code=303)
-    # 漏 reload relationship：lots 可能为空或旧序
-    lots = sorted(list(item.lots or []), key=lambda x: x.id, reverse=True)
-    pts = _spark_points(lots[:4])
-    return render(
-        request,
-        "bay.html",
-        _bay_context(request, db, user, None, pk)
-        | {"partial_spark_hint": len(pts)},
-    )
+        return JSONResponse({"error": "vat_not_found"}, status_code=404)
+    # _vat_payload 内部带口径守卫，对不上会直接 500，绝不返回两套数
+    return JSONResponse(_vat_payload(item))
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口

@@ -56,10 +56,20 @@ class Vat(Base):
     workshop: Mapped["Workshop"] = relationship(back_populates="vats")
     lots: Mapped[list["DipLot"]] = relationship(back_populates="vat")
 
+    # 全应用唯一的缸内批次排序键：先按浸染时间，再按主键兜底并列。
+    # 缸位条折线、展开区近笔、状态校验用的「最新批次」都必须走它。
+    @staticmethod
+    def lot_sort_key(lot: "DipLot"):
+        return (lot.dippedAt, lot.id)
+
+    def ordered_lots(self) -> list["DipLot"]:
+        """旧 → 新，唯一顺序。"""
+        return sorted(self.lots, key=self.lot_sort_key)
+
     def latest_lot(self) -> Optional["DipLot"]:
         if not self.lots:
             return None
-        return sorted(self.lots, key=lambda x: (x.dippedAt, x.id), reverse=True)[0]
+        return max(self.lots, key=self.lot_sort_key)
 
 
 class DipLot(Base):

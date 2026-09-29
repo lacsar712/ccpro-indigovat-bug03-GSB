@@ -21,6 +21,7 @@
   {% if error %}
   <div class="error-box">{{ error }}</div>
   {% endif %}
+  <div class="error-box" x-show="partialError" x-cloak x-text="partialError"></div>
 
   <div class="bay-scroll" role="list">
     <template x-for="v in filteredVats()" :key="v.id">
@@ -131,7 +132,9 @@
   </div>
 
   <p class="rule-foot">工坊只作缸位筛选片；浸染与状态均在缸位展开区内完成，无独立表页。
-    <a href="#" @click.prevent="selectedId && (window.location='/bay/partial/'+selectedId)">局部刷新本缸折线</a></p>
+    <a href="#"
+       @click.prevent="selectedId && refreshVat(selectedId)"
+       :class="{ busy: refreshing === selectedId }">局部刷新本缸折线</a></p>
 </div>
 
 <script>
@@ -141,6 +144,8 @@
       vats: {{ vats | tojson }},
       filterWs: {{ filter_workshop if filter_workshop is not none else 'null' }},
       selectedId: {{ selected_vat if selected_vat is not none else 'null' }},
+      refreshing: null,
+      partialError: null,
       init() {
         const params = new URLSearchParams(window.location.search);
         if (params.has('workshop') && this.filterWs === null) {
@@ -182,6 +187,37 @@
         const d = new Date();
         d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
         return d.toISOString().slice(0, 16);
+      },
+      async refreshVat(id) {
+        if (!id || this.refreshing !== null) return;
+        this.refreshing = id;
+        this.partialError = null;
+        try {
+          const res = await fetch('/bay/partial/' + id, {
+            headers: { 'Accept': 'application/json' },
+          });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const data = await res.json();
+          // 同口径校验：同一缸主键、折线点数必须等于近笔带电位条数，否则判失败
+          const nRedox = (data.recentLots || []).filter(l => l.redoxMv !== null).length;
+          if (
+            data.id !== id ||
+            !Array.isArray(data.spark) ||
+            !Array.isArray(data.recentLots) ||
+            data.spark.length !== nRedox
+          ) {
+            throw new Error('返回数据与展开区口径不一致，已放弃本次刷新');
+          }
+          const i = this.vats.findIndex(v => v.id === id);
+          if (i === -1) throw new Error('该缸不在当前还原台');
+          // 原位整包替换：折线序列、近笔列表、状态角标同一份数据一起刷
+          this.vats.splice(i, 1, data);
+        } catch (e) {
+          // 刷新被拒/失败只提示，绝不清空还原台与展开区
+          this.partialError = '局部刷新失败，保留当前画面：' + e.message;
+        } finally {
+          this.refreshing = null;
+        }
       },
     };
   }
